@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -796,7 +796,8 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
 
 
 @pytest.mark.asyncio
-async def test_streaming_reasoning_usage_counts_across_deltas():
+@pytest.mark.parametrize("retain_history", [False, True], ids=["recount", "retain"])
+async def test_streaming_reasoning_usage_counts_across_deltas(retain_history: bool):
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
     serving._include_reasoning_tokens_details = True
     serving.model_config = None
@@ -806,16 +807,26 @@ async def test_streaming_reasoning_usage_counts_across_deltas():
         DeltaMessage(reasoning="reasoning"),
         DeltaMessage(content="answer"),
     ]
-    parser.count_reasoning_tokens.side_effect = lambda token_ids: sum(
-        token_id == 20 for token_id in token_ids
-    )
+    previous_ids: Sequence[int] = ()
+    reasoning_count = 0
+
+    def count_reasoning_tokens(token_ids: Sequence[int]) -> int:
+        nonlocal previous_ids, reasoning_count
+        if retain_history:
+            # A parser can retain the last input to count only newly delivered tokens.
+            reasoning_count += token_ids[len(previous_ids) :].count(20)
+            previous_ids = token_ids
+            return reasoning_count
+        return token_ids.count(20)
+
+    parser.count_reasoning_tokens.side_effect = count_reasoning_tokens
     serving.parser_cls = MagicMock(return_value=parser)
 
     first = _make_metrics_request_output(metrics=None, token_ids=(10, 20))
     first.outputs[0].text = "<think>reasoning"
     first.outputs[0].finish_reason = None
-    second = _make_metrics_request_output(metrics=None, token_ids=(11, 30))
-    second.outputs[0].text = "</think>answer"
+    second = _make_metrics_request_output(metrics=None, token_ids=(20, 11, 30))
+    second.outputs[0].text = " more</think>answer"
 
     request = ChatCompletionRequest(
         model="test-model",
@@ -840,7 +851,7 @@ async def test_streaming_reasoning_usage_counts_across_deltas():
 
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks[-1]["usage"]["completion_tokens_details"] == {
-        "reasoning_tokens": 1
+        "reasoning_tokens": 2
     }
 
 
