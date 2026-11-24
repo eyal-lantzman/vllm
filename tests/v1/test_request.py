@@ -60,6 +60,8 @@ def test_rust_frontend_prompt_ids_survive_engine_admission():
         Path(__file__).resolve().parents[2]
         / "rust/src/engine-core-client/src/tests/python_compat.py"
     )
+    if not fixtures.parent.is_dir():
+        pytest.skip("Rust client tests are absent from this checkout")
     payloads = subprocess.check_output([sys.executable, str(fixtures)], text=True)
     decoder = MsgpackDecoder(EngineCoreRequest)
     expected = [("req-1", [11, 22]), ("req-defaults", [5, 6, 7])]
@@ -92,6 +94,39 @@ def test_list_prompt_ids_reject_invalid_values(invalid):
     )
     with pytest.raises(msgspec.ValidationError):
         MsgpackDecoder(EngineCoreRequest).decode([wire])
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        ["x", [], b""],
+        ["<i4", [1], "data"],
+        ["<i4", [1], 0],
+        ["<i4", [1], -1],
+        ["<i4", [1], 2],
+        ["<i4", [True], 1],
+        ["<i4", [1], True],
+        ["<i4", [-1], 1],
+    ],
+)
+def test_invalid_packed_descriptor_fails_prompt_validation(descriptor):
+    wire = msgspec.msgpack.encode(
+        ["id", descriptor, None, {}, None, 0.0, None, None, None]
+    )
+    with pytest.raises(msgspec.ValidationError, match="Expected `int`"):
+        MsgpackDecoder(EngineCoreRequest).decode([wire, bytes(4)])
+
+
+@pytest.mark.parametrize("dtype", ["<i4", ">i4", "<u4", ">u4"])
+def test_packed_prompt_accepts_32_bit_integer_encodings(dtype):
+    ids = [1, 70000]
+    descriptor = [dtype, [len(ids)], np.asarray(ids, dtype=dtype).tobytes()]
+    wire = msgspec.msgpack.encode(
+        ["id", descriptor, None, {}, None, 0.0, None, None, None]
+    )
+    received = MsgpackDecoder(EngineCoreRequest).decode([wire])
+    request = Request.from_engine_core_request(received, block_hasher=None)
+    assert request.prompt_token_ids == ids
 
 
 @pytest.mark.parametrize("threshold, frame_count", [(1, 2), (1 << 20, 1)])
@@ -157,6 +192,14 @@ def test_token_buffer_sequence_operations():
     assert copied == [1, 70000, 129279]
     assert sliced == [129279, 1]
     assert isinstance(tokens, array) and tokens.itemsize == 4
+
+
+def test_token_buffer_compares_ndarray_as_one_sequence():
+    tokens = TokenBuffer([1, 2])
+    assert (tokens == np.array([1, 2])) is True
+    assert (tokens != np.array([1, 3])) is True
+    assert (tokens == np.array([[1, 2]])) is False
+    assert (tokens == iter([1, 2])) is False
 
 
 @pytest.mark.parametrize(

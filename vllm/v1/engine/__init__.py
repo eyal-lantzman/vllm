@@ -111,6 +111,9 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
+    # Frontend callers supply lists. Decoded IDs are an ndarray which may
+    # share a receive buffer. Avoid list mutators (clear, sort) and use
+    # np.array_equal for a scalar comparison: ndarray equality is elementwise.
     if TYPE_CHECKING:
         prompt_token_ids: list[int] | None
     else:

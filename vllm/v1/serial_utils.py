@@ -358,10 +358,18 @@ class MsgpackDecoder:
         # Given native types in `obj`, convert to type `t`.
         if isclass(t):
             if t is PromptTokenIds:
-                # An ndarray descriptor starts with its dtype string. Rust
-                # and list-based Python frontends put integer IDs here.
+                # The encoder emits dtype.str, a vector shape, and either
+                # inline data or the index of a frame following the message.
                 match obj:
-                    case [str(), list(), _]:
+                    case ["<i4" | ">i4" | "<u4" | ">u4", [size], data] if (
+                        type(size) is int
+                        and size >= 0
+                        and (
+                            isinstance(data, (bytes, memoryview))
+                            or type(data) is int
+                            and 0 < data < len(self.aux_buffers)
+                        )
+                    ):
                         return self._decode_ndarray(obj).view(PromptTokenIds)
                 ids = msgspec.convert(obj, type=list[_Int32TokenId])
                 return np.asarray(ids, dtype=np.int32).view(PromptTokenIds)

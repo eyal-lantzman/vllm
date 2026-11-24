@@ -35,7 +35,8 @@ if TYPE_CHECKING:
 
 
 if TYPE_CHECKING:
-    # Type-checked as the list it reads like.
+    # The runtime array supports the list operations used by the scheduler.
+    # Do not rely on the full list API (e.g. sort or, on Python 3.12, clear).
     class TokenBuffer(list[int]):
         def __init__(self, tokens: Iterable[int] = ()) -> None: ...
 
@@ -66,6 +67,8 @@ else:
             return item.tolist() if isinstance(index, slice) else item
 
         def __eq__(self, other):
+            if isinstance(other, np.ndarray):
+                return np.array_equal(self, other)
             if isinstance(other, (list, tuple)):
                 return len(self) == len(other) and self.tolist() == as_list(other)
             return array.__eq__(self, other)
