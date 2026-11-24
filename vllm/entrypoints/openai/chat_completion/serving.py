@@ -674,7 +674,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     if parser is not None:
                         generated_token_ids[i].extend(output.token_ids)
                         previous_reasoning_tokens[i] = parser.count_reasoning_tokens(
-                            tuple(generated_token_ids[i])
+                            generated_token_ids[i]
                         )
 
                     # if the message delta is None (e.g. because it was a
