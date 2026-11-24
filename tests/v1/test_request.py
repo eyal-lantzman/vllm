@@ -118,8 +118,8 @@ def test_invalid_packed_descriptor_fails_prompt_validation(descriptor):
 
 
 @pytest.mark.parametrize("dtype", ["<i4", ">i4", "<u4", ">u4"])
-def test_packed_prompt_accepts_32_bit_integer_encodings(dtype):
-    ids = [1, 70000]
+@pytest.mark.parametrize("ids", [[], [0, 70000, 2**31 - 1]])
+def test_packed_prompt_accepts_32_bit_integer_encodings(dtype, ids):
     descriptor = [dtype, [len(ids)], np.asarray(ids, dtype=dtype).tobytes()]
     wire = msgspec.msgpack.encode(
         ["id", descriptor, None, {}, None, 0.0, None, None, None]
@@ -127,6 +127,17 @@ def test_packed_prompt_accepts_32_bit_integer_encodings(dtype):
     received = MsgpackDecoder(EngineCoreRequest).decode([wire])
     request = Request.from_engine_core_request(received, block_hasher=None)
     assert request.prompt_token_ids == ids
+
+
+@pytest.mark.parametrize("dtype", ["<u4", ">u4"])
+@pytest.mark.parametrize("threshold", [1, 1 << 20], ids=["out-of-band", "inline"])
+def test_packed_unsigned_prompt_overflow_fails_during_decode(dtype, threshold):
+    ids = np.array([0, 2**31, 1], dtype=dtype)
+    frames = MsgpackEncoder(size_threshold=threshold).encode(
+        ["id", ids, None, {}, None, 0.0, None, None, None]
+    )
+    with pytest.raises(msgspec.ValidationError, match="signed int32"):
+        MsgpackDecoder(EngineCoreRequest).decode(frames)
 
 
 @pytest.mark.parametrize("threshold, frame_count", [(1, 2), (1 << 20, 1)])

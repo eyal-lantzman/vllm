@@ -370,7 +370,12 @@ class MsgpackDecoder:
                             and 0 < data < len(self.aux_buffers)
                         )
                     ):
-                        return self._decode_ndarray(obj).view(PromptTokenIds)
+                        packed = self._decode_ndarray(obj)
+                        if packed.dtype.kind == "u" and packed.max(initial=0) >= 2**31:
+                            raise ValueError(
+                                "Prompt token ID exceeds signed int32 range"
+                            )
+                        return packed.view(PromptTokenIds)
                 ids = msgspec.convert(obj, type=list[_Int32TokenId])
                 return np.asarray(ids, dtype=np.int32).view(PromptTokenIds)
             if issubclass(t, np.ndarray):
