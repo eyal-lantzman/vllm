@@ -48,12 +48,17 @@ else:
 
         def __new__(cls, tokens: Iterable[int] = ()):
             if isinstance(tokens, np.ndarray):
-                # A 32-bit int array, as the frontends send, copied as one block.
-                assert tokens.dtype.kind in "iu" and tokens.dtype.itemsize == 4
-                buf = super().__new__(cls, "i")
-                buf.frombytes(memoryview(np.ascontiguousarray(tokens)).cast("B"))
-                return buf
-            # From another array of the same type this is a memcpy.
+                if (
+                    tokens.ndim != 1
+                    or tokens.dtype.kind not in "iu"
+                    or tokens.dtype.itemsize != 4
+                ):
+                    raise ValueError("Expected a 1D array of 32-bit integer token IDs")
+                if tokens.dtype == np.int32:
+                    buf = super().__new__(cls, "i")
+                    buf.frombytes(memoryview(np.ascontiguousarray(tokens)).cast("B"))
+                    return buf
+                # Convert other byte orders and range-check unsigned IDs by value.
             return super().__new__(cls, "i", tokens)
 
         def __getitem__(self, index):
