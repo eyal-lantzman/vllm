@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pickle
+import subprocess
+import sys
 from array import array
+from pathlib import Path
 
+import msgspec
 import numpy as np
 import pytest
 
@@ -50,7 +54,48 @@ def test_request_copies_session_id_from_engine_core_request():
     assert request.session_id == "session-1"
 
 
-def test_packed_prompt_owns_tokens_across_engine_admission():
+def test_rust_frontend_prompt_ids_survive_engine_admission():
+    # Use the same request payloads as the Rust client's wire compatibility test.
+    fixtures = (
+        Path(__file__).resolve().parents[2]
+        / "rust/src/engine-core-client/src/tests/python_compat.py"
+    )
+    payloads = subprocess.check_output([sys.executable, str(fixtures)], text=True)
+    decoder = MsgpackDecoder(EngineCoreRequest)
+    expected = [("req-1", [11, 22]), ("req-defaults", [5, 6, 7])]
+    for payload, (request_id, ids) in zip(
+        payloads.splitlines()[:2], expected, strict=True
+    ):
+        received = decoder.decode([bytes.fromhex(payload)])
+        request = Request.from_engine_core_request(received, block_hasher=None)
+        assert request.request_id == request_id
+        assert list(request.prompt_token_ids) == ids
+        assert list(request.all_token_ids) == ids
+
+
+@pytest.mark.parametrize("ids", [None, [], [0], [2**31 - 1, 70000, 1, 0]])
+def test_list_prompt_ids_round_trip(ids: list[int] | None):
+    wire = msgspec.msgpack.encode(["id", ids, None, {}, None, 0.0, None, None, None])
+    received = MsgpackDecoder(EngineCoreRequest).decode([wire])
+    if ids is None:
+        assert received.prompt_token_ids is None
+    else:
+        assert list(received.prompt_token_ids) == ids
+
+
+@pytest.mark.parametrize(
+    "invalid", [[True], [1, 2.5], [1, "2"], ["1", 2, 3], [2**31], [-(2**31) - 1]]
+)
+def test_list_prompt_ids_reject_invalid_values(invalid):
+    wire = msgspec.msgpack.encode(
+        ["id", invalid, None, {}, None, 0.0, None, None, None]
+    )
+    with pytest.raises(msgspec.ValidationError):
+        MsgpackDecoder(EngineCoreRequest).decode([wire])
+
+
+@pytest.mark.parametrize("threshold, frame_count", [(1, 2), (1 << 20, 1)])
+def test_packed_prompt_owns_tokens_across_engine_admission(threshold, frame_count):
     tokens = [1001, 2002] * 4096
     frontend = EngineCoreRequest(
         request_id="packed",
@@ -65,9 +110,15 @@ def test_packed_prompt_owns_tokens_across_engine_admission():
     )
     outbound = _with_packed_prompt(frontend)
     tokens[0] = 3003
-    received = MsgpackDecoder(EngineCoreRequest).decode(
-        MsgpackEncoder().encode(outbound)
-    )
+    encoded = MsgpackEncoder(size_threshold=threshold).encode(outbound)
+    assert len(encoded) == frame_count
+    received = MsgpackDecoder(EngineCoreRequest).decode(encoded)
+    assert isinstance(received.prompt_token_ids, np.ndarray)
+    assert received.prompt_token_ids.dtype == np.int32
+    if frame_count == 2:
+        assert np.shares_memory(
+            received.prompt_token_ids, np.frombuffer(encoded[1], dtype=np.int32)
+        )
     request = Request.from_engine_core_request(received, block_hasher=None)
     assert frontend.prompt_token_ids is tokens
     assert request.prompt_token_ids[0] == 1001

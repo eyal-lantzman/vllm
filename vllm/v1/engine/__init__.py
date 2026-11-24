@@ -22,7 +22,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
-from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.serial_utils import PromptTokenIds, UtilityResult
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -114,7 +114,7 @@ class EngineCoreRequest(
     if TYPE_CHECKING:
         prompt_token_ids: list[int] | None
     else:
-        prompt_token_ids: np.ndarray | None
+        prompt_token_ids: PromptTokenIds | None
     mm_features: list[MultiModalFeatureSpec] | None
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
