@@ -1416,6 +1416,43 @@ def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")
+@pytest.mark.parametrize("planned_reqs", [2, 24])
+def test_glm_token_metadata_respects_live_ragged_batch(planned_reqs: int) -> None:
+    builder = B12xGLM5NextMLASparseMetadataBuilder.__new__(
+        B12xGLM5NextMLASparseMetadataBuilder
+    )
+    builder._ckv_max_reqs = planned_reqs
+    builder.dcp_world_size = 1
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 16
+    query_lens = [1, 0, 127, 1, 3]
+    prefixes = [90, 30, 1040, 2, 514]
+    count = sum(query_lens)
+    lengths = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
+    offsets = torch.cat([lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)])
+    common = SimpleNamespace(
+        num_actual_tokens=count,
+        num_reqs=len(query_lens),
+        query_start_loc=offsets,
+        seq_lens=lengths + lengths.new_tensor(prefixes),
+    )
+    builder.req_id_per_token_buffer = lengths.new_full((count + 1,), -1)
+    builder.cache_seq_lens_per_token_buffer = lengths.new_full((count + 1,), -1)
+
+    request_ids = builder._build_req_id_per_token(common)
+
+    assert request_ids.tolist() == [
+        i for i, length in enumerate(query_lens) for _ in range(length)
+    ]
+    assert builder.req_id_per_token_buffer[-1].item() == -1
+    assert builder.cache_seq_lens_per_token_buffer.tolist() == [
+        depth
+        for prefix, length in zip(prefixes, query_lens)
+        for depth in range(prefix + 1, prefix + length + 1)
+    ] + [-1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")
 @pytest.mark.parametrize("gathered", [False, True])
 @pytest.mark.parametrize("dcp_rank", range(4))
 def test_glm_dcp_compaction_preserves_tail_order_on_graph_replay(
