@@ -3,17 +3,22 @@
 
 import enum
 import time
+from array import array
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pickle import PickleBuffer
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
+from vllm import envs
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -28,6 +33,77 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+if TYPE_CHECKING:
+    # The runtime array supports the list operations used by the scheduler.
+    # Do not rely on the full list API (e.g. sort or, on Python 3.12, clear).
+    class TokenBuffer(list[int]):
+        def __init__(self, tokens: Iterable[int] = ()) -> None: ...
+
+else:
+
+    class TokenBuffer(array):
+        """Mutable int32 token ids with no per-token Python objects."""
+
+        __slots__ = ()
+
+        def __new__(cls, tokens: Iterable[int] = ()):
+            if isinstance(tokens, np.ndarray):
+                if (
+                    tokens.ndim != 1
+                    or tokens.dtype.kind not in "iu"
+                    or tokens.dtype.itemsize != 4
+                ):
+                    raise ValueError("Expected a 1D array of 32-bit integer token IDs")
+                if tokens.dtype == np.int32:
+                    buf = super().__new__(cls, "i")
+                    buf.frombytes(memoryview(np.ascontiguousarray(tokens)).cast("B"))
+                    return buf
+                # Convert other byte orders and range-check unsigned IDs by value.
+            return super().__new__(cls, "i", tokens)
+
+        def __getitem__(self, index):
+            item = array.__getitem__(self, index)
+            return item.tolist() if isinstance(index, slice) else item
+
+        def __eq__(self, other):
+            if isinstance(other, np.ndarray):
+                return np.array_equal(self, other)
+            if isinstance(other, (list, tuple)):
+                return len(self) == len(other) and self.tolist() == as_list(other)
+            return array.__eq__(self, other)
+
+        def __ne__(self, other):
+            return not self == other
+
+        def __add__(self, other):
+            return self.tolist() + as_list(other)
+
+        def __radd__(self, other):
+            return as_list(other) + self.tolist()
+
+        def __iadd__(self, other):
+            self.extend(other)
+            return self
+
+        def copy(self) -> list[int]:
+            return self.tolist()
+
+        def __reduce_ex__(self, protocol):
+            # A PickleBuffer lets MessageQueue send large ids out of band. It wraps
+            # a copy since zmq may hold it past enqueue, blocking resizes of self.
+            data = self.tobytes()
+            return _rebuild_token_buffer, (
+                PickleBuffer(data) if protocol >= 5 else data,
+            )
+
+    def _rebuild_token_buffer(data) -> TokenBuffer:
+        # data is whatever object pickle was given for the buffer, e.g. bytes,
+        # a bytearray or a zmq.Frame, so copy out of it rather than keep it.
+        tokens = TokenBuffer()
+        tokens.frombytes(data)
+        return tokens
 
 
 @dataclass
@@ -131,7 +207,12 @@ class Request:
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
-        self.prompt_token_ids = prompt_token_ids
+        packed = envs.VLLM_USE_PACKED_PROMPT_IDS
+        self.prompt_token_ids = (
+            TokenBuffer(prompt_token_ids)
+            if packed and prompt_token_ids is not None
+            else prompt_token_ids
+        )
         self.prompt_embeds = prompt_embeds
         # Per-position mask used in mixed-mode (chat completion with
         # prompt_embeds). `None` except when both `prompt_token_ids` and
@@ -141,7 +222,7 @@ class Request:
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-            prompt_token_ids, prompt_embeds
+            self.prompt_token_ids, prompt_embeds
         )
         if recurrent_instruction_boundary is not None and not (
             0 < recurrent_instruction_boundary < self.num_prompt_tokens
@@ -156,17 +237,24 @@ class Request:
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
+            if packed:
+                self._all_token_ids = TokenBuffer(self._all_token_ids)
         elif self.prompt_is_token_ids is None:
-            self._all_token_ids = self.prompt_token_ids.copy()
+            self._all_token_ids = (
+                TokenBuffer(self.prompt_token_ids)
+                if packed
+                else self.prompt_token_ids.copy()
+            )
         else:
             # Mixed-mode prompt: positions covered by prompt_embeds hold a sentinel
             # special token id that may lie outside the embedding. Zero them, matching
             # the no-token-ids case above, so embedding gathers over these placeholder
             # ids stay in bounds; the actual inputs come from prompt_embeds.
-            self._all_token_ids = [
+            history_type = TokenBuffer if packed else list
+            self._all_token_ids = history_type(
                 t if is_tok else 0
                 for t, is_tok in zip(self.prompt_token_ids, self.prompt_is_token_ids)
-            ]
+            )
 
         # Used in async scheduling.
         self.num_output_placeholders = 0

@@ -5,12 +5,13 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -22,7 +23,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
-from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.serial_utils import PromptTokenIds, UtilityResult
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -163,6 +164,14 @@ class EngineCoreRequest(
     # direct token requests leave it unset.
     recurrent_instruction_boundary: int | None = None
 
+    @staticmethod
+    def wire_type() -> type["EngineCoreRequest"]:
+        return (
+            _PackedEngineCoreRequest
+            if envs.VLLM_USE_PACKED_PROMPT_IDS
+            else EngineCoreRequest
+        )
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -170,6 +179,13 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+
+class _PackedEngineCoreRequest(EngineCoreRequest):
+    # An ndarray can share a receive buffer. It has no list mutators such as
+    # clear or sort, and equality is elementwise. Admission takes an owned copy.
+    if not TYPE_CHECKING:
+        prompt_token_ids: PromptTokenIds | None
 
 
 class EngineCoreEventType(enum.IntEnum):

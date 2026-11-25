@@ -37,6 +37,14 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_packed_prompt_ids_opt_in_preserves_compile_cache(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_PACKED_PROMPT_IDS", raising=False)
+    assert not envs.VLLM_USE_PACKED_PROMPT_IDS
+    monkeypatch.setenv("VLLM_USE_PACKED_PROMPT_IDS", "1")
+    assert envs.VLLM_USE_PACKED_PROMPT_IDS
+    assert "VLLM_USE_PACKED_PROMPT_IDS" not in envs.compile_factors()
+
+
 def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_API_KEY", "sk-super-secret")
 
