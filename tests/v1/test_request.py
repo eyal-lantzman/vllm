@@ -20,7 +20,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 @pytest.fixture
 def packed_mode(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", True)
+    monkeypatch.setitem(vars(envs), "VLLM_USE_PACKED_PROMPT_IDS", True)
 
 
 def test_request_status_fmt_str():
@@ -61,7 +61,7 @@ def test_request_copies_session_id_from_engine_core_request():
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_rust_frontend_prompt_ids_survive_engine_admission(monkeypatch, enabled):
-    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
+    monkeypatch.setitem(vars(envs), "VLLM_USE_PACKED_PROMPT_IDS", enabled)
     # Use the same request payloads as the Rust client's wire compatibility test.
     fixtures = (
         Path(__file__).resolve().parents[2]
@@ -85,7 +85,7 @@ def test_rust_frontend_prompt_ids_survive_engine_admission(monkeypatch, enabled)
 @pytest.mark.parametrize("ids", [None, [], [0], [2**31 - 1, 70000, 1, 0]])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_list_prompt_ids_round_trip(monkeypatch, enabled, ids: list[int] | None):
-    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
+    monkeypatch.setitem(vars(envs), "VLLM_USE_PACKED_PROMPT_IDS", enabled)
     wire = msgspec.msgpack.encode(["id", ids, None, {}, None, 0.0, None, None, None])
     received = MsgpackDecoder(EngineCoreRequest.wire_type()).decode([wire])
     if ids is None:
@@ -196,7 +196,7 @@ def test_packed_prompt_owns_tokens_across_engine_admission(
 def test_prompt_packing_switch_controls_transport_and_engine_storage(
     monkeypatch, enabled
 ):
-    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
+    monkeypatch.setitem(vars(envs), "VLLM_USE_PACKED_PROMPT_IDS", enabled)
     ids = [1001, 2002] * 64
     frontend = EngineCoreRequest(
         request_id="packing-switch",
