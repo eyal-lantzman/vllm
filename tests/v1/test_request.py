@@ -10,6 +10,7 @@ from pathlib import Path
 import msgspec
 import numpy as np
 import pytest
+import torch
 
 from vllm import SamplingParams, envs
 from vllm.v1.engine import EngineCoreRequest
@@ -221,6 +222,29 @@ def test_prompt_packing_switch_controls_transport_and_engine_storage(
     req.append_output_token_ids(3)
     assert list(req.all_token_ids) == [*ids, 3]
     assert frontend.prompt_token_ids == ids
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("ids", "mask", "expected"),
+    [(None, None, [0, 0]), ([7, 99], [True, False], [7, 0])],
+)
+def test_embedding_positions_keep_zero_history_with_either_storage(
+    monkeypatch, enabled, ids, mask, expected
+):
+    monkeypatch.setitem(vars(envs), "VLLM_USE_PACKED_PROMPT_IDS", enabled)
+    request = Request(
+        request_id="with-embeds",
+        prompt_token_ids=ids,
+        prompt_embeds=torch.zeros(2, 4),
+        prompt_is_token_ids=mask,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    assert type(request._all_token_ids) is (TokenBuffer if enabled else list)
+    request.append_output_token_ids(3)
+    assert list(request.all_token_ids) == [*expected, 3]
+    assert request.prompt_token_ids == ids
 
 
 def test_token_buffer_sequence_operations():
