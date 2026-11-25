@@ -2800,18 +2800,43 @@ def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(dcp):
     assert manager.publish_boundary_checkpoint(producer, 29, kind="prompt") is not None
     manager.free(producer)
 
-    for name, suffix, expected in (
-        ("extended", tokens + [80, 81], 29),
-        ("tail-edit", tokens[:27] + [80, 81, 82], 17),
-        ("earlier-edit", tokens[:16] + [80] + tokens[17:], 0),
+    edited = tokens[:27] + [80, 81, 82]
+    for name, suffix, boundary, expected in (
+        ("extended", tokens + [80, 81], 17, 29),
+        ("tail-edit", edited, 17, 17),
+        ("later-tail", edited, 19, 17),
+        ("earlier-edit", tokens[:16] + [80] + tokens[17:], 17, 0),
     ):
         consumer = make_request(name, suffix, 4, sha256)
+        consumer.recurrent_prefill_tail_boundary = boundary
         blocks, hit, _ = manager.get_computed_blocks(consumer)
         assert hit == expected
         assert (
             manager.allocate_slots(consumer, len(suffix) - hit, hit, blocks) is not None
         )
+        slots = consumer.boundary_checkpoint_blocks
+        assert slots is not None and all(slots[0]) and all(slots[1])
+        if hit < boundary:
+            assert all(slots[3])
+        else:
+            assert len(slots) == 2
         manager.free(consumer)
+
+    # Eviction between lookup and acquisition must restore the cold reservation.
+    retry = make_request("retry", edited, 4, sha256)
+    retry.recurrent_prefill_tail_boundary = 17
+    blocks, hit, _ = manager.get_computed_blocks(retry)
+    assert hit == 17
+    assert manager.boundary_checkpoints is not None
+    manager.boundary_checkpoints.invalidate(tail.checkpoint_id)
+    assert manager.allocate_slots(retry, len(edited) - hit, hit, blocks) is None
+    assert retry.boundary_checkpoint is None
+    blocks, hit, _ = manager.get_computed_blocks(retry)
+    assert hit == 0
+    assert manager.allocate_slots(retry, len(edited), hit, blocks) is not None
+    assert retry.boundary_checkpoint_blocks is not None
+    assert all(retry.boundary_checkpoint_blocks[3])
+    manager.free(retry)
     _, retained = manager.take_kv_cache_block_copies()
     manager.block_pool.free_blocks(retained)
     assert manager.reset_prefix_cache()

@@ -89,8 +89,8 @@ required page is reclaimed. A complete repeated-prompt hit samples its saved
 hidden state without a target-model forward pass.
 
 Admission checks the blocks needed for scheduled tokens, speculative lookahead,
-and checkpoint copies. A request restored at or past its instruction boundary
-needs no private storage for a second copy of that instruction checkpoint.
+and checkpoint copies. A request needs private storage for an instruction or prefill-tail
+checkpoint only while its restored prefix is short of that boundary.
 A request's output-token limit does not reserve future
 cache capacity. Checkpoints held by active readers and in-flight copies remain
 pinned; unused checkpoints, including those reusable by queued requests, may be
