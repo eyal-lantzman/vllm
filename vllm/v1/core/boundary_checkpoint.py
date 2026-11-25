@@ -114,7 +114,8 @@ def boundary_checkpoint_slots(request: Request) -> tuple[int, ...]:
         checkpoint is None or checkpoint.num_tokens < boundary
     ):
         slots += (INSTRUCTION_CHECKPOINT_SLOT,)
-    if request.recurrent_prefill_tail_boundary is not None:
+    tail = request.recurrent_prefill_tail_boundary
+    if tail is not None and (checkpoint is None or checkpoint.num_tokens < tail):
         slots += (PREFILL_TAIL_CHECKPOINT_SLOT,)
     return slots
 
