@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -206,8 +207,11 @@ class Request:
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
+        packed = envs.VLLM_USE_PACKED_PROMPT_IDS
         self.prompt_token_ids = (
-            TokenBuffer(prompt_token_ids) if prompt_token_ids is not None else None
+            TokenBuffer(prompt_token_ids)
+            if packed and prompt_token_ids is not None
+            else prompt_token_ids
         )
         self.prompt_embeds = prompt_embeds
         # Per-position mask used in mixed-mode (chat completion with
@@ -232,15 +236,22 @@ class Request:
         self.recurrent_prefill_tail_boundary: int | None = None
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
-            self._all_token_ids = TokenBuffer([0] * self.num_prompt_tokens)
+            self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
+            if packed:
+                self._all_token_ids = TokenBuffer(self._all_token_ids)
         elif self.prompt_is_token_ids is None:
-            self._all_token_ids = TokenBuffer(self.prompt_token_ids)
+            self._all_token_ids = (
+                TokenBuffer(self.prompt_token_ids)
+                if packed
+                else self.prompt_token_ids.copy()
+            )
         else:
             # Mixed-mode prompt: positions covered by prompt_embeds hold a sentinel
             # special token id that may lie outside the embedding. Zero them, matching
             # the no-token-ids case above, so embedding gathers over these placeholder
             # ids stay in bounds; the actual inputs come from prompt_embeds.
-            self._all_token_ids = TokenBuffer(
+            history_type = TokenBuffer if packed else list
+            self._all_token_ids = history_type(
                 t if is_tok else 0
                 for t, is_tok in zip(self.prompt_token_ids, self.prompt_is_token_ids)
             )

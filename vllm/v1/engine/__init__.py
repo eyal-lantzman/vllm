@@ -11,6 +11,7 @@ import msgspec
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -111,13 +112,7 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    # Frontend callers supply lists. Decoded IDs are an ndarray which may
-    # share a receive buffer. Avoid list mutators (clear, sort) and use
-    # np.array_equal for a scalar comparison: ndarray equality is elementwise.
-    if TYPE_CHECKING:
-        prompt_token_ids: list[int] | None
-    else:
-        prompt_token_ids: PromptTokenIds | None
+    prompt_token_ids: list[int] | None
     mm_features: list[MultiModalFeatureSpec] | None
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
@@ -169,6 +164,14 @@ class EngineCoreRequest(
     # direct token requests leave it unset.
     recurrent_instruction_boundary: int | None = None
 
+    @staticmethod
+    def wire_type() -> type["EngineCoreRequest"]:
+        return (
+            _PackedEngineCoreRequest
+            if envs.VLLM_USE_PACKED_PROMPT_IDS
+            else EngineCoreRequest
+        )
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -176,6 +179,13 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+
+class _PackedEngineCoreRequest(EngineCoreRequest):
+    # An ndarray can share a receive buffer. It has no list mutators such as
+    # clear or sort, and equality is elementwise. Admission takes an owned copy.
+    if not TYPE_CHECKING:
+        prompt_token_ids: PromptTokenIds | None
 
 
 class EngineCoreEventType(enum.IntEnum):

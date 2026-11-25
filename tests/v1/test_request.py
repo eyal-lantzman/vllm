@@ -11,11 +11,16 @@ import msgspec
 import numpy as np
 import pytest
 
-from vllm import SamplingParams
+from vllm import SamplingParams, envs
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import _with_packed_prompt
 from vllm.v1.request import Request, RequestStatus, TokenBuffer
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+
+@pytest.fixture
+def packed_mode(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", True)
 
 
 def test_request_status_fmt_str():
@@ -54,7 +59,9 @@ def test_request_copies_session_id_from_engine_core_request():
     assert request.session_id == "session-1"
 
 
-def test_rust_frontend_prompt_ids_survive_engine_admission():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rust_frontend_prompt_ids_survive_engine_admission(monkeypatch, enabled):
+    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
     # Use the same request payloads as the Rust client's wire compatibility test.
     fixtures = (
         Path(__file__).resolve().parents[2]
@@ -63,7 +70,7 @@ def test_rust_frontend_prompt_ids_survive_engine_admission():
     if not fixtures.parent.is_dir():
         pytest.skip("Rust client tests are absent from this checkout")
     payloads = subprocess.check_output([sys.executable, str(fixtures)], text=True)
-    decoder = MsgpackDecoder(EngineCoreRequest)
+    decoder = MsgpackDecoder(EngineCoreRequest.wire_type())
     expected = [("req-1", [11, 22]), ("req-defaults", [5, 6, 7])]
     for payload, (request_id, ids) in zip(
         payloads.splitlines()[:2], expected, strict=True
@@ -76,9 +83,11 @@ def test_rust_frontend_prompt_ids_survive_engine_admission():
 
 
 @pytest.mark.parametrize("ids", [None, [], [0], [2**31 - 1, 70000, 1, 0]])
-def test_list_prompt_ids_round_trip(ids: list[int] | None):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_list_prompt_ids_round_trip(monkeypatch, enabled, ids: list[int] | None):
+    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
     wire = msgspec.msgpack.encode(["id", ids, None, {}, None, 0.0, None, None, None])
-    received = MsgpackDecoder(EngineCoreRequest).decode([wire])
+    received = MsgpackDecoder(EngineCoreRequest.wire_type()).decode([wire])
     if ids is None:
         assert received.prompt_token_ids is None
     else:
@@ -88,12 +97,12 @@ def test_list_prompt_ids_round_trip(ids: list[int] | None):
 @pytest.mark.parametrize(
     "invalid", [[True], [1, 2.5], [1, "2"], ["1", 2, 3], [2**31], [-(2**31) - 1]]
 )
-def test_list_prompt_ids_reject_invalid_values(invalid):
+def test_list_prompt_ids_reject_invalid_values(packed_mode, invalid):
     wire = msgspec.msgpack.encode(
         ["id", invalid, None, {}, None, 0.0, None, None, None]
     )
     with pytest.raises(msgspec.ValidationError):
-        MsgpackDecoder(EngineCoreRequest).decode([wire])
+        MsgpackDecoder(EngineCoreRequest.wire_type()).decode([wire])
 
 
 @pytest.mark.parametrize(
@@ -109,39 +118,43 @@ def test_list_prompt_ids_reject_invalid_values(invalid):
         ["<i4", [-1], 1],
     ],
 )
-def test_invalid_packed_descriptor_fails_prompt_validation(descriptor):
+def test_invalid_packed_descriptor_fails_prompt_validation(packed_mode, descriptor):
     wire = msgspec.msgpack.encode(
         ["id", descriptor, None, {}, None, 0.0, None, None, None]
     )
     with pytest.raises(msgspec.ValidationError, match="Expected `int`"):
-        MsgpackDecoder(EngineCoreRequest).decode([wire, bytes(4)])
+        MsgpackDecoder(EngineCoreRequest.wire_type()).decode([wire, bytes(4)])
 
 
 @pytest.mark.parametrize("dtype", ["<i4", ">i4", "<u4", ">u4"])
 @pytest.mark.parametrize("ids", [[], [0, 70000, 2**31 - 1]])
-def test_packed_prompt_accepts_32_bit_integer_encodings(dtype, ids):
+def test_packed_prompt_accepts_32_bit_integer_encodings(packed_mode, dtype, ids):
     descriptor = [dtype, [len(ids)], np.asarray(ids, dtype=dtype).tobytes()]
     wire = msgspec.msgpack.encode(
         ["id", descriptor, None, {}, None, 0.0, None, None, None]
     )
-    received = MsgpackDecoder(EngineCoreRequest).decode([wire])
+    received = MsgpackDecoder(EngineCoreRequest.wire_type()).decode([wire])
     request = Request.from_engine_core_request(received, block_hasher=None)
     assert request.prompt_token_ids == ids
 
 
 @pytest.mark.parametrize("dtype", ["<u4", ">u4"])
 @pytest.mark.parametrize("threshold", [1, 1 << 20], ids=["out-of-band", "inline"])
-def test_packed_unsigned_prompt_overflow_fails_during_decode(dtype, threshold):
+def test_packed_unsigned_prompt_overflow_fails_during_decode(
+    packed_mode, dtype, threshold
+):
     ids = np.array([0, 2**31, 1], dtype=dtype)
     frames = MsgpackEncoder(size_threshold=threshold).encode(
         ["id", ids, None, {}, None, 0.0, None, None, None]
     )
     with pytest.raises(msgspec.ValidationError, match="signed int32"):
-        MsgpackDecoder(EngineCoreRequest).decode(frames)
+        MsgpackDecoder(EngineCoreRequest.wire_type()).decode(frames)
 
 
 @pytest.mark.parametrize("threshold, frame_count", [(1, 2), (1 << 20, 1)])
-def test_packed_prompt_owns_tokens_across_engine_admission(threshold, frame_count):
+def test_packed_prompt_owns_tokens_across_engine_admission(
+    packed_mode, threshold, frame_count
+):
     tokens = [1001, 2002] * 4096
     frontend = EngineCoreRequest(
         request_id="packed",
@@ -158,7 +171,7 @@ def test_packed_prompt_owns_tokens_across_engine_admission(threshold, frame_coun
     tokens[0] = 3003
     encoded = MsgpackEncoder(size_threshold=threshold).encode(outbound)
     assert len(encoded) == frame_count
-    received = MsgpackDecoder(EngineCoreRequest).decode(encoded)
+    received = MsgpackDecoder(EngineCoreRequest.wire_type()).decode(encoded)
     assert isinstance(received.prompt_token_ids, np.ndarray)
     assert received.prompt_token_ids.dtype == np.int32
     if frame_count == 2:
@@ -177,6 +190,37 @@ def test_packed_prompt_owns_tokens_across_engine_admission(threshold, frame_coun
     assert list(pickle.loads(snapshot, buffers=frames)) == [1001, 2002] * 4096
     assert request.all_token_ids[-1] == 4004
     assert len(request.prompt_token_ids) == 8192
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prompt_packing_switch_controls_transport_and_engine_storage(
+    monkeypatch, enabled
+):
+    monkeypatch.setattr(envs, "VLLM_USE_PACKED_PROMPT_IDS", enabled)
+    ids = [1001, 2002] * 64
+    frontend = EngineCoreRequest(
+        request_id="packing-switch",
+        prompt_token_ids=ids,
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    outbound = _with_packed_prompt(frontend)
+    frames = MsgpackEncoder(size_threshold=1).encode(outbound)
+    assert (outbound is frontend) == (not enabled)
+    assert len(frames) == (2 if enabled else 1)
+    decoded = MsgpackDecoder(EngineCoreRequest.wire_type()).decode(frames)
+    assert isinstance(decoded.prompt_token_ids, np.ndarray if enabled else list)
+    req = Request.from_engine_core_request(decoded, block_hasher=None)
+    history_type = TokenBuffer if enabled else list
+    assert type(req.prompt_token_ids) is type(req._all_token_ids) is history_type
+    req.append_output_token_ids(3)
+    assert list(req.all_token_ids) == [*ids, 3]
+    assert frontend.prompt_token_ids == ids
 
 
 def test_token_buffer_sequence_operations():

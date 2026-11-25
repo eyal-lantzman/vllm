@@ -82,7 +82,9 @@ def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
     """Copy of request with its prompt token ids as an int32 ndarray, which is
     sent out of band when long and decoded by the engine without a Python int
     per token. The frontend keeps the original."""
-    if not isinstance(request.prompt_token_ids, list):
+    if not envs.VLLM_USE_PACKED_PROMPT_IDS or not isinstance(
+        request.prompt_token_ids, list
+    ):
         return request
     packed = np.frombuffer(array("i", request.prompt_token_ids), dtype=np.int32)
     return msgspec.structs.replace(request, prompt_token_ids=packed)
