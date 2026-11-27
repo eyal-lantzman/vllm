@@ -327,6 +327,42 @@ def test_late_caller_gets_a_new_slot_without_revoking_owners(monkeypatch, lanes)
     assert scheduler._cold_prefill_ends.keys() == (owners - {"a0"}) | {"late"}
 
 
+def test_async_loan_passes_to_under_share_caller_after_worker_completion(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_FAIR_COLD_PREFILLS", True)
+    monkeypatch.setattr(envs, "VLLM_COLD_PREFILL_CALLER_LIMIT", 1)
+    scheduler = budget(monkeypatch, 2, async_scheduling=True)
+    caller_request(scheduler, "owner", "bulk", 96)
+    loan = caller_request(scheduler, "loan", "bulk", 32)
+    for _ in range(2):
+        complete(scheduler, scheduler.schedule())
+    assert scheduler._cold_prefill_ends == {"owner": 96, "loan": 32}
+
+    caller_request(scheduler, "older", "bulk", 64)
+    caller_request(scheduler, "late", "occasional", 64)
+    penultimate = scheduler.schedule()
+    final = scheduler.schedule()
+    assert penultimate.num_scheduled_tokens["loan"] == 8
+    assert final.num_scheduled_tokens["loan"] == 8
+    assert loan.num_in_flight_tokens == 16
+    complete(scheduler, penultimate)
+    assert loan.num_in_flight_tokens == 8
+    waiting_step = scheduler.schedule()
+    assert not {"older", "late"}.intersection(waiting_step.num_scheduled_tokens)
+    assert scheduler._cold_prefill_ends == {"owner": 96, "loan": 32}
+
+    complete(scheduler, final)
+    assert (
+        loan.num_computed_tokens - loan.num_in_flight_tokens >= loan.num_prompt_tokens
+    )
+    assert scheduler._cold_prefill_ends.keys() == {"owner"}
+    next_step = scheduler.schedule()
+    assert {"older", "late"}.intersection(next_step.num_scheduled_tokens) == {"late"}
+    assert scheduler._cold_prefill_ends == {"owner": 96, "late": 64}
+    assert "older" in {
+        r.request_id for r in (*scheduler.waiting, *scheduler.skipped_waiting)
+    }
+
+
 @pytest.mark.parametrize("lanes", [1, "auto"])
 def test_failed_competitor_allocation_cannot_strand_a_loan(monkeypatch, lanes):
     scheduler = caller_budget(monkeypatch, max_parallel_prefills=lanes)
