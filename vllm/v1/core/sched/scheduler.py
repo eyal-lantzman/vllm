@@ -503,6 +503,22 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._cold_prefill_limit = envs.VLLM_MAX_COLD_PREFILLS
+        if self._cold_prefill_limit < 0:
+            raise ValueError("VLLM_MAX_COLD_PREFILLS must be nonnegative")
+        # External imports and priority scheduling retain their own admission policy.
+        if self._cold_prefill_limit and (
+            self.connector is not None
+            or self.ec_connector is not None
+            or self.policy != SchedulingPolicy.FCFS
+        ):
+            logger.warning(
+                "VLLM_MAX_COLD_PREFILLS applies only to local FCFS admission; "
+                "disabling the cold prefill limit for this scheduler."
+            )
+            self._cold_prefill_limit = 0
+        # Token position to finish before each admitted request releases its slot.
+        self._cold_prefill_ends: dict[str, int] = {}
 
     def _mamba_block_aligned_split(
         self,
@@ -1619,6 +1635,21 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                # A parked request can become cheap as another publishes its prefix.
+                costly_prefill = bool(self._cold_prefill_limit) and (
+                    request.num_tokens - num_computed_tokens
+                    >= self.max_num_scheduled_tokens
+                )
+                if (
+                    costly_prefill
+                    and len(self._cold_prefill_ends) >= self._cold_prefill_limit
+                ):
+                    request_queue.remove_request(request)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1859,6 +1890,8 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                if costly_prefill:
+                    self._cold_prefill_ends[request_id] = request.num_tokens
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
@@ -2425,6 +2458,7 @@ class Scheduler(SchedulerInterface):
         )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
+        self._cold_prefill_ends.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -2948,6 +2982,15 @@ class Scheduler(SchedulerInterface):
             if output_is_stale and request.drop_stale_output:
                 continue
 
+            # Only verified worker progress can release an admitted prompt's slot.
+            prefill_end = self._cold_prefill_ends.get(req_id)
+            if (
+                prefill_end is not None
+                and not output_is_stale
+                and request.num_computed_tokens - request.num_in_flight_tokens
+                >= prefill_end
+            ):
+                del self._cold_prefill_ends[req_id]
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -3383,6 +3426,8 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        # A paused input stream owns no active prefill.
+        self._cold_prefill_ends.pop(request.request_id, None)
         if request.streaming_queue:
             update = request.streaming_queue.popleft()
             if update is None:
@@ -3623,6 +3668,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        self._cold_prefill_ends.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         self.prefill_interleave_controller.forget(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
