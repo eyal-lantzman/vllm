@@ -3,7 +3,7 @@
 import itertools
 import math
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -503,6 +503,77 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._cold_prefill_limit = envs.VLLM_MAX_COLD_PREFILLS
+        if self._cold_prefill_limit < 0:
+            raise ValueError("VLLM_MAX_COLD_PREFILLS must be nonnegative")
+        # External imports and priority scheduling retain their own admission policy.
+        if self._cold_prefill_limit and (
+            self.connector is not None
+            or self.ec_connector is not None
+            or self.policy != SchedulingPolicy.FCFS
+        ):
+            logger.warning(
+                "VLLM_MAX_COLD_PREFILLS applies only to local FCFS admission; "
+                "disabling the cold prefill limit for this scheduler."
+            )
+            self._cold_prefill_limit = 0
+        self._cold_caller_limit = 0
+        if envs.VLLM_FAIR_COLD_PREFILLS and self._cold_prefill_limit:
+            self._cold_caller_limit = envs.VLLM_COLD_PREFILL_CALLER_LIMIT
+            if self._cold_caller_limit < 1:
+                raise ValueError("VLLM_COLD_PREFILL_CALLER_LIMIT must be positive")
+        # Token position to finish before each admitted request releases its slot.
+        self._cold_prefill_ends: dict[str, int] = {}
+
+    @staticmethod
+    def _cold_prefill_caller(request: Request) -> str | None:
+        # Deployments enabling this policy must have their gateway overwrite
+        # the label from a trusted identity. Missing/invalid labels share None.
+        params = request.sampling_params
+        if params is None or not isinstance(params.extra_args, dict):
+            return None
+        label = params.extra_args.get("cold_prefill_caller")
+        return label if isinstance(label, str) and label.strip() else None
+
+    def _under_share_cold_waiter(
+        self,
+        owners: Counter[str | None],
+        tried_callers: set[str | None],
+        interleave: PrefillInterleaveStep | None,
+    ) -> Request | None:
+        # Probe the oldest eligible candidate for each below-share caller.
+        # Actual cold work is checked in the normal admission path after lookup.
+        for candidate in itertools.chain(self.skipped_waiting, self.waiting):
+            grammar_waiter = (
+                candidate.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+            )
+            if not grammar_waiter and candidate.status not in (
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+            ):
+                continue
+            caller = self._cold_prefill_caller(candidate)
+            if caller in tried_callers or owners[caller] >= self._cold_caller_limit:
+                continue
+            if (
+                candidate.num_tokens - candidate.num_computed_tokens
+                < self.max_num_scheduled_tokens
+                or (
+                    interleave
+                    and (
+                        candidate.request_id in interleave.unavailable_ids
+                        # A ready grammar may be promoted after lanes were ranked.
+                        or (
+                            candidate.request_id not in interleave.rank
+                            and not grammar_waiter
+                        )
+                    )
+                )
+            ):
+                tried_callers.add(caller)
+                continue
+            return candidate
+        return None
 
     def _mamba_block_aligned_split(
         self,
@@ -1354,6 +1425,10 @@ class Scheduler(SchedulerInterface):
             # their capacity and slot, so only they may still be admitted.
             ready_imports: list[Request] | None = None
             considered_ids: set[str] = set()
+            caller_owners: Counter[str | None] | None = None
+            tried_callers: set[str | None]
+            fair_candidate: Request | None = None
+            fair_lender: str | None = None
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if (
@@ -1367,7 +1442,9 @@ class Scheduler(SchedulerInterface):
                 if num_running >= self.max_num_running_reqs:
                     break
 
-                selected: Request | None = None
+                preferred = fair_candidate is not None
+                selected, fair_candidate = fair_candidate, None
+                lender, fair_lender = fair_lender, None
                 if boundary_logits_request is not None:
                     selected, boundary_logits_request = boundary_logits_request, None
                 elif ready_imports is not None:
@@ -1507,6 +1584,8 @@ class Scheduler(SchedulerInterface):
                         and num_new_local_computed_tokens == request.num_tokens
                     )
                     if boundary_logits_only and num_scheduled_tokens:
+                        if preferred:
+                            continue
                         if ready_imports is None:
                             break
                         continue
@@ -1619,6 +1698,61 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                # A parked request can become cheap as another publishes its prefix.
+                costly_prefill = bool(self._cold_prefill_limit) and (
+                    request.num_tokens - num_computed_tokens
+                    >= self.max_num_scheduled_tokens
+                )
+                if (
+                    costly_prefill
+                    and len(self._cold_prefill_ends) >= self._cold_prefill_limit
+                ):
+                    request_queue.remove_request(request)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if preferred and not costly_prefill:
+                    # This cached caller cannot contend for a costly slot.
+                    continue
+                if costly_prefill and self._cold_caller_limit:
+                    if caller_owners is None:
+                        tried_callers = set()
+                        caller_owners = Counter(
+                            self._cold_prefill_caller(self.requests[rid])
+                            for rid in self._cold_prefill_ends
+                        )
+                    caller = self._cold_prefill_caller(request)
+                    if caller_owners[caller] >= self._cold_caller_limit and (
+                        prefill_interleave_step is None
+                        or prefill_interleave_step.is_selected(request_id)
+                        or self._request_has_local_prefill(request)
+                    ):
+                        candidate = self._under_share_cold_waiter(
+                            caller_owners, tried_callers, prefill_interleave_step
+                        )
+                        if candidate is not None:
+                            if (
+                                prefill_interleave_step
+                                and not prefill_interleave_step.is_selected(request_id)
+                            ):
+                                # A promoted grammar now participates in normal lane
+                                # selection. Only a selected waiter can lend a lane.
+                                continue
+                            fair_candidate = candidate
+                            # Retry the borrower if the preferred request fails
+                            # the normal eligibility or allocation checks.
+                            tried_callers.add(self._cold_prefill_caller(fair_candidate))
+                            if (
+                                prefill_interleave_step
+                                and not prefill_interleave_step.is_selected(
+                                    fair_candidate.request_id
+                                )
+                            ):
+                                fair_lender = request_id
+                            continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1628,7 +1762,10 @@ class Scheduler(SchedulerInterface):
                 )
                 interleaved_local_prefill = (
                     prefill_interleave_step is not None
-                    and prefill_interleave_step.is_selected(request_id)
+                    and (
+                        prefill_interleave_step.is_selected(request_id)
+                        or lender is not None
+                    )
                     and has_local_prefill
                 )
                 if prefill_interleave_step is not None and not has_local_prefill:
@@ -1712,8 +1849,9 @@ class Scheduler(SchedulerInterface):
                         not self.scheduler_config.enable_chunked_prefill
                         and num_new_tokens > request_token_budget
                     ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
+                        # An oversized probe may fail even if the FCFS head fits.
+                        if preferred:
+                            continue
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1729,6 +1867,8 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             if not interleaved_local_prefill:
+                                if preferred:
+                                    continue
                                 break
                             request_queue.remove_request(request)
                             assert prefill_interleave_step is not None
@@ -1767,6 +1907,8 @@ class Scheduler(SchedulerInterface):
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         if not interleaved_local_prefill:
+                            if preferred:
+                                continue
                             break
                         request_queue.remove_request(request)
                         assert prefill_interleave_step is not None
@@ -1824,6 +1966,8 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     if not interleaved_local_prefill:
+                        if preferred:
+                            continue
                         # FCFS stops here; imports that already own their
                         # capacity cannot take it from this request.
                         if ready_imports is None:
@@ -1859,6 +2003,27 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                if lender is not None:
+                    # Transfer one waiting compute lane only after KV allocation
+                    # succeeds. Failed probes leave its original owner runnable.
+                    assert prefill_interleave_step is not None
+                    prefill_interleave_step.selected_ids.remove(lender)
+                    prefill_interleave_step.selected_ids.add(request_id)
+                if caller_owners is not None:
+                    tried_callers.discard(self._cold_prefill_caller(request))
+                if costly_prefill:
+                    self._cold_prefill_ends[request_id] = request.num_tokens
+                    if caller_owners is not None:
+                        caller = self._cold_prefill_caller(request)
+                        caller_owners[caller] += 1
+                        if preferred or caller_owners[caller] > self._cold_caller_limit:
+                            logger.info(
+                                "Cold prefill caller share: %s caller_slots=%d "
+                                "engine_slots=%d",
+                                "preferred" if preferred else "loan",
+                                caller_owners[caller],
+                                len(self._cold_prefill_ends),
+                            )
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
@@ -2425,6 +2590,7 @@ class Scheduler(SchedulerInterface):
         )
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
+        self._cold_prefill_ends.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -2948,6 +3114,15 @@ class Scheduler(SchedulerInterface):
             if output_is_stale and request.drop_stale_output:
                 continue
 
+            # Only verified worker progress can release an admitted prompt's slot.
+            prefill_end = self._cold_prefill_ends.get(req_id)
+            if (
+                prefill_end is not None
+                and not output_is_stale
+                and request.num_computed_tokens - request.num_in_flight_tokens
+                >= prefill_end
+            ):
+                del self._cold_prefill_ends[req_id]
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -3383,6 +3558,8 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        # A paused input stream owns no active prefill.
+        self._cold_prefill_ends.pop(request.request_id, None)
         if request.streaming_queue:
             update = request.streaming_queue.popleft()
             if update is None:
@@ -3623,6 +3800,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        self._cold_prefill_ends.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         self.prefill_interleave_controller.forget(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
